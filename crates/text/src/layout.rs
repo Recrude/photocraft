@@ -25,6 +25,7 @@ use photocraft_doc::TextLayer;
 use photocraft_doc::text::{Caps, CharStyle, Kerning, Orientation, TextAlign, TextDirection, TextShape};
 use skrifa::raw::types::Tag;
 
+use crate::cjk::CjkScript;
 use crate::fonts::FontDb;
 
 /// Photoshop synthesizes small caps for faces without an OpenType `smcp` table. Keep the same
@@ -521,6 +522,8 @@ impl Layouter {
                 _ => SmallCapsMode::None,
             })
             .collect();
+        // The CJK fallback order of each run's own language, when it is Chinese, Japanese or Korean.
+        let run_orders: Vec<Option<[CjkScript; 4]>> = out.styles.iter().map(|s| s.language.as_deref().and_then(crate::cjk::language_script_order)).collect();
         for (pi, prange) in split_paragraphs(text).into_iter().enumerate() {
             if stop {
                 break;
@@ -578,14 +581,27 @@ impl Layouter {
             // Scripts the loaded fonts may lack (Arabic, Japanese, …): a host serving a font for them
             // fetches it (`served`); it joins the fallback stack once it arrives.
             crate::served::request_for_text(&ptext);
-            let fallback: Vec<String> = fonts.fallback_stack().map(str::to_string).collect();
+            // Shared Han takes the forms of the CJK fonts tried first: those of the run's language,
+            // else Korean ones for Korean text (Hanja among Hangul), else the UI locale's.
+            let text_order = crate::cjk::text_script_order(content, crate::cjk::ui_script_order());
+            let mut stacks: Vec<([CjkScript; 4], Vec<String>)> = Vec::new();
+            let stack_of: Vec<usize> = run_orders
+                .iter()
+                .map(|order| {
+                    let order = order.unwrap_or(text_order);
+                    stacks.iter().position(|(o, _)| *o == order).unwrap_or_else(|| {
+                        stacks.push((order, fonts.fallback_stack(&order).map(str::to_string).collect()));
+                        stacks.len() - 1
+                    })
+                })
+                .collect();
             // Shapes the paragraph, each tab widened by its letter spacing in `tab_spacing` (px).
             let build = |lcx: &mut LayoutContext<RunBrush>, fcx: &mut parley::FontContext, tab_spacing: &[f32]| -> Layout<RunBrush> {
                 let mut b = lcx.ranged_builder(fcx, &ptext, 1.0, false);
                 // Paragraph-start style as the default (covers the direction mark and empty
                 // paragraphs), then every run piece intersecting this paragraph.
                 let si0 = style_at(prange.start);
-                for p in style_props(&out.styles[si0], k, &fallback, si0 as u32, small_caps[si0]) {
+                for p in style_props(&out.styles[si0], k, &stacks[stack_of[si0]].1, si0 as u32, small_caps[si0]) {
                     b.push_default(p);
                 }
                 // Paragraph text breaks a word wider than the box at the box edge, as Photoshop
@@ -601,7 +617,7 @@ impl Layouter {
                         continue;
                     }
                     let range = (a - prange.start + prefix.len())..(z - prange.start + prefix.len());
-                    for p in style_props(st, k, &fallback, ri as u32, small_caps[ri]) {
+                    for p in style_props(st, k, &stacks[stack_of[ri]].1, ri as u32, small_caps[ri]) {
                         b.push(p, range.clone());
                     }
                     if vertical {

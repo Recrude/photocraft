@@ -59,7 +59,8 @@ fn inflate_font(deflated: &[u8]) -> Vec<u8> {
 
 /// Families tried (if installed) after the requested one, for missing glyphs. The Southeast Asian
 /// and CJK families ([`THAI_FAMILIES`], [`KHMER_FAMILIES`], [`LAO_FAMILIES`], [`MYANMAR_FAMILIES`],
-/// [`INDIC_FAMILIES`], [`crate::cjk::families`]) go between these two lists, in the UI locale's script order.
+/// [`INDIC_FAMILIES`], [`crate::cjk::families`]) go between these two lists, the CJK ones in the
+/// run's script order (its language's, its text's, else the UI locale's; see [`crate::cjk`]).
 const FALLBACK_CANDIDATES: &[&str] = &["Noto Sans", "Segoe UI", "DejaVu Sans", "Geeza Pro", "Arial Hebrew", "Noto Sans Arabic", "Noto Sans Hebrew"];
 /// Thai-capable families: Windows (Leelawadee UI since Windows 8; Tahoma and Leelawadee on
 /// older systems), macOS (Thonburi, Sukhumvit Set) and Linux (Noto). Text in a font without Thai
@@ -189,7 +190,9 @@ pub struct FontDb {
     system_loaded: bool,
     /// PostScript name → (family, weight, italic), filled lazily.
     ps_cache: HashMap<String, Option<ResolvedFont>>,
-    fallbacks: Vec<String>,
+    /// Installed fallback families for each CJK script order ([`crate::cjk::script_orders`]),
+    /// the UI locale's first.
+    fallbacks: Vec<([crate::cjk::CjkScript; 4], Vec<String>)>,
     /// Preferences ▸ Type ▸ Missing Glyph Protection: route glyphs the chosen face lacks through
     /// [`Self::fallback_stack`] (#1909). Off, only the default family shapes the text.
     missing_glyph_protection: bool,
@@ -328,20 +331,29 @@ impl FontDb {
                 }
             }
         }
-        let order = crate::cjk::ui_script_order();
-        self.fallbacks = fallback_candidates(&order).into_iter().filter(|f| c.family_id(f).is_some()).map(str::to_string).collect();
         // Served fonts that are a script's fallback (the manifest's `scripts`), once they arrived.
-        for f in crate::served::script_fallback_families() {
-            if c.family_id(&f).is_some() && !self.fallbacks.contains(&f) {
-                self.fallbacks.push(f);
+        let served = crate::served::script_fallback_families();
+        self.fallbacks.clear();
+        for order in std::iter::once(crate::cjk::ui_script_order()).chain(crate::cjk::script_orders()) {
+            if self.fallbacks.iter().any(|(o, _)| *o == order) {
+                continue;
             }
+            let mut fallbacks: Vec<String> = fallback_candidates(&order).into_iter().filter(|f| c.family_id(f).is_some()).map(str::to_string).collect();
+            for f in &served {
+                if c.family_id(f).is_some() && !fallbacks.contains(f) {
+                    fallbacks.push(f.clone());
+                }
+            }
+            self.fallbacks.push((order, fallbacks));
         }
     }
 
-    /// Families available after the requested one (bundled default + installed coverage fonts).
-    /// With missing glyph protection off (Preferences ▸ Type), only the default family shapes.
-    pub(crate) fn fallback_stack(&self) -> impl Iterator<Item = &str> {
-        let fallbacks = self.missing_glyph_protection.then_some(self.fallbacks.iter().map(String::as_str));
+    /// Families available after the requested one (bundled default + installed coverage fonts),
+    /// the CJK ones in `order` ([`crate::cjk::script_order`]). With missing glyph protection off
+    /// (Preferences ▸ Type), only the default family shapes.
+    pub(crate) fn fallback_stack(&self, order: &[crate::cjk::CjkScript; 4]) -> impl Iterator<Item = &str> {
+        let fallbacks = self.fallbacks.iter().find(|(o, _)| o == order).or(self.fallbacks.first()).map(|(_, f)| f);
+        let fallbacks = self.missing_glyph_protection.then_some(fallbacks.into_iter().flatten().map(String::as_str));
         std::iter::once(DEFAULT_FAMILY).chain(fallbacks.into_iter().flatten())
     }
 

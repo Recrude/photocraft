@@ -5,6 +5,8 @@
 //! font for the locale's script goes first: Japanese forms only for a Japanese locale, Chinese
 //! forms for zh-Hans / zh-Hant, Korean (Hanja-capable) fonts for ko. Kana always prefers a
 //! Japanese font, Hangul a Korean one and Bopomofo a Traditional Chinese one.
+//! The Type tool orders each run by its own language when that is Chinese, Japanese or Korean,
+//! and Korean text (Hangul, no kana) as Korean, before falling back to the locale.
 //!
 //! Used by the egui shell (UI fallback fonts, loaded lazily) and by [`crate::fonts::FontDb`]
 //! (Type tool fallback families).
@@ -58,11 +60,18 @@ pub fn classify(c: char) -> Option<CjkChar> {
 /// for shared Han when the locale is Japanese.
 pub fn script_order(locale: Option<&str>) -> [CjkScript; 4] {
     use CjkScript::*;
-    let tag = locale.unwrap_or("").split(['.', '@']).next().unwrap_or("").to_ascii_lowercase().replace('_', "-");
+    language_script_order(locale.unwrap_or("")).unwrap_or([SimplifiedChinese, TraditionalChinese, Japanese, Korean])
+}
+
+/// [`script_order`] for a Chinese, Japanese or Korean language or locale tag (a run's BCP-47
+/// language such as `ko`, `ja-JP` or `zh-Hant`), its own script first; `None` for any other.
+pub fn language_script_order(tag: &str) -> Option<[CjkScript; 4]> {
+    use CjkScript::*;
+    let tag = tag.split(['.', '@']).next().unwrap_or("").to_ascii_lowercase().replace('_', "-");
     let mut parts = tag.split('-');
     let lang = parts.next().unwrap_or("");
     let rest: Vec<&str> = parts.collect();
-    match lang {
+    Some(match lang {
         "ja" => [Japanese, SimplifiedChinese, TraditionalChinese, Korean],
         "ko" => [Korean, TraditionalChinese, SimplifiedChinese, Japanese],
         "zh" | "yue" => {
@@ -74,8 +83,29 @@ pub fn script_order(locale: Option<&str>) -> [CjkScript; 4] {
                 [SimplifiedChinese, TraditionalChinese, Japanese, Korean]
             }
         }
-        _ => [SimplifiedChinese, TraditionalChinese, Japanese, Korean],
+        _ => return None,
+    })
+}
+
+/// Every order [`script_order`] gives (one per script first): the CJK fallback orders a run can
+/// ask for.
+pub fn script_orders() -> [[CjkScript; 4]; 4] {
+    ["ja", "zh-Hans", "zh-Hant", "ko"].map(|tag| script_order(Some(tag)))
+}
+
+/// Script order for runs without a CJK language in a paragraph of `text`: Korean first when the
+/// text has Hangul and no kana, as Korean written with Hanja does, so its Han takes Korean forms
+/// rather than the Chinese (or Japanese) ones of `ui`, the UI locale's order; else `ui`.
+pub fn text_script_order(text: &str, ui: [CjkScript; 4]) -> [CjkScript; 4] {
+    let mut hangul = false;
+    for c in text.chars() {
+        match classify(c) {
+            Some(CjkChar::Kana) => return ui,
+            Some(CjkChar::Hangul) => hangul = true,
+            _ => {}
+        }
     }
+    if hangul { script_order(Some("ko")) } else { ui }
 }
 
 /// The user's UI locale (cached). `PHOTOCRAFT_LOCALE` overrides; then macOS's preferred
@@ -554,6 +584,33 @@ mod tests {
             let o = script_order(Some(l));
             for s in [Japanese, SimplifiedChinese, TraditionalChinese, Korean] {
                 assert!(o.contains(&s), "{l}: {o:?}");
+            }
+        }
+    }
+
+    /// A run's CJK language orders its fallback; without one, Korean text (Hangul, no kana) puts
+    /// Korean first whatever the UI locale, so Hanja beside Hangul don't take Chinese forms.
+    #[test]
+    fn run_orders_follow_language_then_korean_text() {
+        let first = |o: Option<[CjkScript; 4]>| o.map(|o| o[0]);
+        assert_eq!(first(language_script_order("ko")), Some(Korean));
+        assert_eq!(first(language_script_order("ko-KR")), Some(Korean));
+        assert_eq!(first(language_script_order("ja-JP")), Some(Japanese));
+        assert_eq!(first(language_script_order("zh-Hant")), Some(TraditionalChinese));
+        assert_eq!(first(language_script_order("zh-Hans-CN")), Some(SimplifiedChinese));
+        assert_eq!(first(language_script_order("zh")), Some(SimplifiedChinese));
+        // Other languages (Konkani's `kok` is not Korean) leave the order to the text.
+        for tag in ["", "en", "de-DE", "kok", "!!@@"] {
+            assert_eq!(language_script_order(tag), None, "{tag}");
+        }
+        // One order per script first: every order `script_order` gives has its fallback list.
+        assert_eq!(script_orders().map(|o| o[0]), [Japanese, SimplifiedChinese, TraditionalChinese, Korean]);
+        for ui in [script_order(Some("en")), script_order(Some("ja")), script_order(Some("zh-Hant"))] {
+            assert_eq!(text_script_order("大韓民國은 民主共和國이다", ui)[0], Korean, "{ui:?}");
+            assert_eq!(text_script_order("한글 漢字", ui), script_order(Some("ko")));
+            // Han alone, kana with Hangul, Latin and empty text keep the UI locale's order.
+            for text in ["大韓民國", "漢字と한글", "かな", "Latin", ""] {
+                assert_eq!(text_script_order(text, ui), ui, "{text}");
             }
         }
     }

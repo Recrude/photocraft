@@ -1776,9 +1776,100 @@ fn a_served_script_fallback_joins_the_fallback_stack_once_it_arrives() {
     };
     crate::served::add_fonts(&crate::served::parse_manifest("Cairo | Regular | fonts/cairo/Cairo.ttf | Arab,Latn\n").0);
     let mut db = fonts::FontDb::new();
-    assert!(!db.fallback_stack().any(|f| f == "Cairo"), "not before it arrives");
+    let ui = crate::cjk::ui_script_order();
+    assert!(!db.fallback_stack(&ui).any(|f| f == "Cairo"), "not before it arrives");
     db.register_font_data(cairo.bytes.to_vec());
-    assert!(db.fallback_stack().any(|f| f == "Cairo"), "{:?}", db.fallback_stack().collect::<Vec<_>>());
+    assert!(db.fallback_stack(&ui).any(|f| f == "Cairo"), "{:?}", db.fallback_stack(&ui).collect::<Vec<_>>());
+}
+
+/// Points `tag`'s table record at `table`, appended to `font`.
+fn replace_table(font: &mut Vec<u8>, tag: &[u8; 4], table: &[u8]) {
+    while !font.len().is_multiple_of(4) {
+        font.push(0);
+    }
+    let count = u16::from_be_bytes([font[4], font[5]]) as usize;
+    let record = (0..count).map(|i| 12 + i * 16).find(|r| &font[*r..r + 4] == tag).unwrap();
+    let offset = font.len() as u32;
+    font[record + 8..record + 12].copy_from_slice(&offset.to_be_bytes());
+    font[record + 12..record + 16].copy_from_slice(&(table.len() as u32).to_be_bytes());
+    font.extend_from_slice(table);
+}
+
+/// A stand-in for an installed CJK font, without CJK font files: a copy of a bundled font named
+/// `family` that also maps `han` to its glyph for 'W'.
+fn cjk_stand_in(source: &[u8], family: &str, han: char) -> Vec<u8> {
+    use skrifa::MetadataProvider;
+    let cmap = skrifa::FontRef::new(source).unwrap().charmap();
+    let mut map: Vec<(u32, u32)> = cmap.mappings().map(|(c, g)| (c, g.to_u32())).collect();
+    map.push((han as u32, cmap.map('W').unwrap().to_u32()));
+    map.sort_unstable();
+    // One full-Unicode (platform 3, encoding 10) format 12 subtable, one group per character.
+    let mut table: Vec<u8> = [0u16, 1, 3, 10].iter().flat_map(|v| v.to_be_bytes()).collect();
+    table.extend(12u32.to_be_bytes());
+    table.extend(12u16.to_be_bytes());
+    table.extend(0u16.to_be_bytes());
+    for v in [16 + 12 * map.len() as u32, 0, map.len() as u32] {
+        table.extend(v.to_be_bytes());
+    }
+    for (c, g) in map {
+        for v in [c, c, g] {
+            table.extend(v.to_be_bytes());
+        }
+    }
+    let mut font = source.to_vec();
+    replace_table(&mut font, b"cmap", &table);
+    let ps = family.replace(' ', "");
+    let names = [(1u16, family), (2, "Regular"), (6, ps.as_str()), (16, family)];
+    let mut table: Vec<u8> = [0u16, names.len() as u16, (6 + names.len() * 12) as u16].iter().flat_map(|v| v.to_be_bytes()).collect();
+    let mut strings = Vec::new();
+    for (id, value) in names {
+        let encoded: Vec<u8> = value.encode_utf16().flat_map(u16::to_be_bytes).collect();
+        for n in [3, 1, 0x409, id, encoded.len() as u16, strings.len() as u16] {
+            table.extend(n.to_be_bytes());
+        }
+        strings.extend(encoded);
+    }
+    table.extend(strings);
+    replace_table(&mut font, b"name", &table);
+    font
+}
+
+/// Han shared by the CJK scripts takes the forms of the CJK fonts tried first: those of the run's
+/// own language, else Korean ones in Korean text (Hanja among Hangul) whatever the UI locale,
+/// else the UI locale's. Before, every run followed the UI locale, so an English system drew
+/// the Hanja of a Korean sentence with Simplified Chinese forms.
+#[test]
+fn cjk_fallback_follows_the_runs_language_and_korean_text() {
+    let mut e = TextEngine::new();
+    let stand_ins = [
+        (crate::cjk::CjkScript::Korean, "Noto Sans CJK KR", fonts::JETBRAINS_MONO_REGULAR.as_slice()),
+        (crate::cjk::CjkScript::SimplifiedChinese, "Noto Sans CJK SC", fonts::INTER_REGULAR.as_slice()),
+        (crate::cjk::CjkScript::TraditionalChinese, "Noto Sans CJK TC", fonts::INTER_MEDIUM.as_slice()),
+        (crate::cjk::CjkScript::Japanese, "Noto Sans CJK JP", fonts::INTER_SEMIBOLD.as_slice()),
+    ];
+    for (_, family, source) in stand_ins {
+        e.fonts.register_font_data(cjk_stand_in(source, family, '韓'));
+    }
+    let ui = stand_ins.iter().find(|(s, ..)| *s == crate::cjk::ui_script_order()[0]).unwrap().1;
+    let mut han_font = |text: &str, language: Option<&str>| -> String {
+        let style = CharStyle { font_family: "Inter".into(), size_pt: 24.0, language: language.map(str::to_string), ..Default::default() };
+        let l = e.layout(&styled(text, style), 72.0);
+        let names = l.faces.iter().filter_map(|f| {
+            use skrifa::MetadataProvider;
+            let font = skrifa::FontRef::from_index(f.font.data.as_ref(), f.font.index).ok()?;
+            Some(font.localized_strings(skrifa::string::StringId::FAMILY_NAME).english_or_first()?.to_string())
+        });
+        names.filter(|n| n.starts_with("Noto Sans CJK")).collect::<Vec<_>>().join(", ")
+    };
+    for (language, family) in [("ko", "Noto Sans CJK KR"), ("ja", "Noto Sans CJK JP"), ("zh-Hans", "Noto Sans CJK SC"), ("zh-Hant", "Noto Sans CJK TC")] {
+        assert_eq!(han_font("韓", Some(language)), family, "{language}");
+        assert_eq!(han_font("한韓", Some(language)), family, "the run's language wins over its text: {language}");
+    }
+    for language in [None, Some("en")] {
+        assert_eq!(han_font("한국 韓", language), "Noto Sans CJK KR", "Korean text: {language:?}");
+        assert_eq!(han_font("韓", language), ui, "Han alone follows the UI locale: {language:?}");
+        assert_eq!(han_font("한かな韓", language), ui, "kana makes it not Korean: {language:?}");
+    }
 }
 
 /// #1317: Photoshop keeps the last line of a text box whose baseline is inside the box even
@@ -1889,13 +1980,14 @@ fn missing_glyph_protection_can_turn_the_fallback_stack_off() {
         return;
     };
     let mut db = fonts::FontDb::new();
+    let ui = crate::cjk::ui_script_order();
     db.register_font_data(cairo.bytes.to_vec());
     assert!(db.missing_glyph_protection(), "on by default, as in Photoshop");
-    assert!(db.fallback_stack().any(|f| f == "Cairo"));
+    assert!(db.fallback_stack(&ui).any(|f| f == "Cairo"));
     db.set_missing_glyph_protection(false);
-    assert_eq!(db.fallback_stack().collect::<Vec<_>>(), [fonts::DEFAULT_FAMILY], "only the default family remains");
+    assert_eq!(db.fallback_stack(&ui).collect::<Vec<_>>(), [fonts::DEFAULT_FAMILY], "only the default family remains");
     db.set_missing_glyph_protection(true);
-    assert!(db.fallback_stack().any(|f| f == "Cairo"), "turning it back on restores the coverage fonts");
+    assert!(db.fallback_stack(&ui).any(|f| f == "Cairo"), "turning it back on restores the coverage fonts");
 }
 
 /// The shared engine's missing-glyph protection follows the setting without waiting for the
