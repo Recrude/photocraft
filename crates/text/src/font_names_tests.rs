@@ -149,13 +149,14 @@ fn installed_yoon_numeric_faces() {
     }
 }
 
-/// A copy of `source` whose name table spells the family in English and in Japanese.
-fn localized_font(source: &[u8], english: &str, japanese: &str) -> Vec<u8> {
+/// A copy of `source` whose name table spells the family in English and in the language whose
+/// name-record language ID is `lang` (0x411 Japanese, 0x412 Korean).
+fn localized_font(source: &[u8], english: &str, lang: u16, native: &str) -> Vec<u8> {
     let mut bytes = source.to_vec();
     let count = u16::from_be_bytes(bytes[4..6].try_into().unwrap()) as usize;
     let name_record = (0..count).map(|i| 12 + i * 16).find(|r| &bytes[*r..r + 4] == b"name").unwrap();
     let ps = english.replace(' ', "");
-    let names = [(0x409u16, 1u16, english), (0x409, 2, "Regular"), (0x409, 6, ps.as_str()), (0x409, 16, english), (0x411, 1, japanese), (0x411, 16, japanese)];
+    let names = [(0x409u16, 1u16, english), (0x409, 2, "Regular"), (0x409, 6, ps.as_str()), (0x409, 16, english), (lang, 1, native), (lang, 16, native)];
     let mut table = Vec::new();
     let mut strings = Vec::new();
     for value in [0u16, names.len() as u16, (6 + names.len() * 12) as u16] {
@@ -181,10 +182,59 @@ fn localized_font(source: &[u8], english: &str, japanese: &str) -> Vec<u8> {
 #[test]
 fn localized_family_names_map_english_families_to_native_names() {
     let mut db = FontDb::new();
-    assert_eq!(db.register_font_data(localized_font(&INTER_REGULAR, "Gothic Test", "ゴシック テスト")), ["Gothic Test"]);
+    assert_eq!(db.register_font_data(localized_font(&INTER_REGULAR, "Gothic Test", 0x411, "ゴシック テスト")), ["Gothic Test"]);
     assert!(db.families().iter().any(|f| f == "Gothic Test"));
     let local = db.localized_family_names();
     assert_eq!(local.get("Gothic Test").map(String::as_str), Some("ゴシック テスト"));
     assert!(!local.contains_key(DEFAULT_FAMILY));
     assert!(local.values().all(|v| !v.is_empty()));
+}
+
+/// A font named in its own language ("맑은 고딕" for "Malgun Gothic", as Korean apps and users
+/// write it) is found as its family: fontique only registers the English family name.
+#[test]
+fn a_family_is_found_by_its_native_name() {
+    let mut db = FontDb::new();
+    // A miss before the font arrives must not hide it afterwards.
+    assert!(!db.has_family("고딕 테스트 Neo"));
+    assert_eq!(db.register_font_data(localized_font(&INTER_SEMIBOLD, "Gothic Test Neo", 0x412, "고딕 테스트 Neo")), ["Gothic Test Neo"]);
+    for name in ["고딕 테스트 Neo", "고딕 테스트 NEO"] {
+        assert!(db.has_family(name), "{name}");
+        assert_eq!(db.family_of_native(name).as_deref(), Some("Gothic Test Neo"), "{name}");
+        assert_eq!(db.faces(name).first().map(|f| f.family.as_str()), Some("Gothic Test Neo"));
+    }
+    assert_eq!(db.charmap("고딕 테스트 Neo", 600, false), db.charmap("Gothic Test Neo", 600, false));
+    // The English name is unchanged, and the native one is not listed as a family of its own.
+    assert!(db.has_family("Gothic Test Neo"));
+    assert_eq!(db.family_of_native("Gothic Test Neo"), None);
+    assert!(!db.families().iter().any(|f| f == "고딕 테스트 Neo"));
+    // Unknown names stay missing.
+    for name in ["없는 글꼴", "고딕 테스트", ""] {
+        assert!(!db.has_family(name), "{name}");
+        assert_eq!(db.family_of_native(name), None, "{name}");
+    }
+    // A family that has the name itself wins over another font's native name.
+    db.register_font_data(localized_font(&JETBRAINS_MONO_REGULAR, "고딕 테스트 Neo", 0x412, "모노 테스트"));
+    assert_eq!(db.family_of_native("고딕 테스트 Neo"), None);
+    assert_eq!(db.faces("고딕 테스트 Neo").first().map(|f| f.family.as_str()), Some("고딕 테스트 Neo"));
+    assert_eq!(db.family_of_native("모노 테스트").as_deref(), Some("고딕 테스트 Neo"));
+}
+
+/// A run in a family named in its own language is laid out in that font, not the fallback.
+#[test]
+fn a_native_family_name_lays_out_in_that_font() {
+    use photocraft_doc::{TextLayer, text::TextRun};
+    let mut engine = crate::TextEngine::new();
+    engine.fonts.register_font_data(localized_font(&JETBRAINS_MONO_REGULAR, "Mono Test", 0x412, "모노 테스트"));
+    let layer = |family: &str| TextLayer {
+        text: "iiii".into(),
+        runs: vec![TextRun { len: 4, style: CharStyle { font_family: family.into(), size_pt: 32.0, ..Default::default() } }],
+        ..Default::default()
+    };
+    let native = engine.layout(&layer("모노 테스트"), 72.0);
+    let english = engine.layout(&layer("Mono Test"), 72.0);
+    let fallback = engine.layout(&layer(DEFAULT_FAMILY), 72.0);
+    assert!((native.lines[0].x1 - english.lines[0].x1).abs() < 0.01, "{} vs {}", native.lines[0].x1, english.lines[0].x1);
+    assert!((native.lines[0].x1 - fallback.lines[0].x1).abs() > 1.0, "monospace i is wider than Inter's");
+    assert_eq!(native.styles[0].font_family, "Mono Test");
 }

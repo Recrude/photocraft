@@ -464,6 +464,10 @@ impl Layouter {
         // Resolve families (PostScript names from PSDs, unknown families).
         for r in &runs {
             let mut s = r.style.clone();
+            // The shaper knows families by their English names only (see `family_of_native`).
+            if let Some(family) = fonts.family_of_native(&s.font_family) {
+                s.font_family = family;
+            }
             if let Some(ps) = s.postscript_name.clone()
                 && !fonts.faces(&s.font_family).iter().any(|f| f.postscript_name.as_deref() == Some(&ps))
             {

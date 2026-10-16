@@ -10,7 +10,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 
 use parley::FontContext;
-use parley::fontique::{Blob, Collection, CollectionOptions, FontInfoOverride, FontStyle, FontWeight, FontWidth, GenericFamily, SourceCache};
+use parley::fontique::{
+    Blob, Collection, CollectionOptions, FamilyId, FamilyInfo, FontInfoOverride, FontStyle, FontWeight, FontWidth, GenericFamily, SourceCache,
+};
 use skrifa::raw::{FileRef, TableProvider, types::Tag};
 use skrifa::{MetadataProvider, string::StringId};
 
@@ -195,6 +197,9 @@ pub struct FontDb {
     missing_glyph_protection: bool,
     face_cache: HashMap<String, Vec<FaceInfo>>,
     face_aliases: HashMap<(String, usize), String>,
+    /// Localized (non-English) family name, ASCII-lowercased → family, built on the first name no
+    /// family has ([`Self::family_of_native`]).
+    native_families: Option<HashMap<String, String>>,
     /// This is the shared engine's database: registrations also move [`shared_generation`].
     shared: bool,
 }
@@ -217,6 +222,7 @@ impl FontDb {
             missing_glyph_protection: true,
             face_cache: HashMap::new(),
             face_aliases: HashMap::new(),
+            native_families: None,
             shared: false,
         };
         for (_, bytes) in BUNDLED {
@@ -267,6 +273,7 @@ impl FontDb {
             }
             self.ps_cache.clear();
             self.face_cache.clear();
+            self.native_families = None;
             self.refresh_generics();
         }
     }
@@ -297,6 +304,7 @@ impl FontDb {
         names.sort_by_key(|n| (is_hidden_family(n), n.to_lowercase()));
         self.ps_cache.clear();
         self.face_cache.clear();
+        self.native_families = None;
         self.refresh_generics();
         GENERATION.fetch_add(1, Ordering::Relaxed);
         if self.shared {
@@ -372,31 +380,75 @@ impl FontDb {
     pub fn localized_family_names(&mut self) -> HashMap<String, String> {
         let mut out = HashMap::new();
         for family in self.families() {
-            let Some(info) = self.fcx.collection.family_by_name(&family) else {
-                continue;
-            };
-            let Some(face) = info.fonts().first() else {
-                continue;
-            };
-            let Some(blob) = face.load(Some(&mut self.fcx.source_cache)) else {
-                continue;
-            };
-            let Ok(font) = skrifa::FontRef::from_index(blob.as_ref(), face.index()) else {
-                continue;
-            };
-            let names =
-                |id| -> Vec<(String, Option<String>)> { font.localized_strings(id).map(|s| (s.chars().collect(), s.language().map(str::to_string))).collect() };
-            let typographic = names(StringId::TYPOGRAPHIC_FAMILY_NAME);
-            let names = if typographic.is_empty() { names(StringId::FAMILY_NAME) } else { typographic };
-            if let Some(local) = localized_name(&family, &names) {
+            if let Some(local) = localized_name(&family, &self.family_name_records(&family)) {
                 out.insert(family, local);
             }
         }
         out
     }
 
+    /// The `(name, language)` family-name records of `family`'s first face: typographic family
+    /// (name 16), else family (name 1), the ID fontique takes the family's name from.
+    fn family_name_records(&mut self, family: &str) -> Vec<(String, Option<String>)> {
+        let Some(info) = self.fcx.collection.family_by_name(family) else {
+            return Vec::new();
+        };
+        let Some(face) = info.fonts().first() else {
+            return Vec::new();
+        };
+        let Some(blob) = face.load(Some(&mut self.fcx.source_cache)) else {
+            return Vec::new();
+        };
+        let Ok(font) = skrifa::FontRef::from_index(blob.as_ref(), face.index()) else {
+            return Vec::new();
+        };
+        let names =
+            |id| -> Vec<(String, Option<String>)> { font.localized_strings(id).map(|s| (s.chars().collect(), s.language().map(str::to_string))).collect() };
+        let typographic = names(StringId::TYPOGRAPHIC_FAMILY_NAME);
+        if typographic.is_empty() { names(StringId::FAMILY_NAME) } else { typographic }
+    }
+
+    /// Is there a family called `name`, in English or in its own language
+    /// ([`Self::family_of_native`])?
     pub fn has_family(&mut self, name: &str) -> bool {
-        self.fcx.collection.family_id(name).is_some()
+        self.family_id(name).is_some()
+    }
+
+    /// The family whose localized (non-English) name is `name`, ignoring ASCII case, when no
+    /// family is called `name` itself: "맑은 고딕" is "Malgun Gothic". Fontique registers fonts
+    /// loaded from files or memory under their English (or first) family name only, so a font
+    /// named in its own language (typed by a user, or written by a localized app) would fall
+    /// back. The names are indexed on the first miss after fonts are registered.
+    pub fn family_of_native(&mut self, name: &str) -> Option<String> {
+        if name.is_empty() || self.fcx.collection.family_id(name).is_some() {
+            return None;
+        }
+        if self.native_families.is_none() {
+            let mut index = HashMap::new();
+            for family in self.families() {
+                let records = self.family_name_records(&family);
+                for native in localized_names(&family, &records) {
+                    index.entry(native.to_ascii_lowercase()).or_insert_with(|| family.clone());
+                }
+            }
+            self.native_families = Some(index);
+        }
+        self.native_families.as_ref()?.get(&name.to_ascii_lowercase()).cloned()
+    }
+
+    /// The family called `name`, in English or in its own language.
+    fn family_id(&mut self, name: &str) -> Option<FamilyId> {
+        if let Some(id) = self.fcx.collection.family_id(name) {
+            return Some(id);
+        }
+        let family = self.family_of_native(name)?;
+        self.fcx.collection.family_id(&family)
+    }
+
+    /// The faces of the family called `name`, in English or in its own language.
+    pub(crate) fn family_info(&mut self, name: &str) -> Option<FamilyInfo> {
+        let id = self.family_id(name)?;
+        self.fcx.collection.family(id)
     }
 
     /// Whether the face selected for a character style exposes an OpenType GSUB feature.
@@ -405,7 +457,7 @@ impl FontDb {
     /// regular face can lack a feature that its italic or bold sibling has (or vice versa).
     pub(crate) fn selected_face_has_feature(&mut self, family: &str, weight: u16, italic: bool, feature: Tag) -> bool {
         let family = if family.is_empty() || !self.has_family(family) { DEFAULT_FAMILY } else { family };
-        let Some(info) = self.fcx.collection.family_by_name(family) else {
+        let Some(info) = self.family_info(family) else {
             return false;
         };
         let style = if italic { FontStyle::Italic } else { FontStyle::Normal };
@@ -429,7 +481,7 @@ impl FontDb {
         if let Some(faces) = self.face_cache.get(family) {
             return faces.clone();
         }
-        let Some(info) = self.fcx.collection.family_by_name(family) else {
+        let Some(info) = self.family_info(family) else {
             return Vec::new();
         };
         let faces: Vec<_> = info
@@ -481,7 +533,7 @@ impl FontDb {
         let alias = if let Some(alias) = self.face_aliases.get(&key) {
             alias.clone()
         } else {
-            let Some(info) = self.fcx.collection.family_by_name(&family) else { return };
+            let Some(info) = self.family_info(&family) else { return };
             let Some(font) = info.fonts().get(index) else { return };
             let Some(blob) = font.load(Some(&mut self.fcx.source_cache)) else { return };
             let Some(blob) = isolated_face(blob, font.index()) else { return };
@@ -802,15 +854,19 @@ pub(crate) fn system_font_dirs() -> Vec<std::path::PathBuf> {
 /// one in a language other than English that differs from `english` (the name the font menus
 /// store). `None` when the font only names itself in English (most fonts).
 pub fn localized_name(english: &str, names: &[(String, Option<String>)]) -> Option<String> {
+    localized_names(english, names).next().map(str::to_string)
+}
+
+/// Every name among `names` that [`localized_name`] could pick, in order.
+fn localized_names<'a>(english: &'a str, names: &'a [(String, Option<String>)]) -> impl Iterator<Item = &'a str> {
     let is_english = |lang: &str| {
         let primary = lang.split(['-', '_']).next().unwrap_or(lang);
         primary.eq_ignore_ascii_case("en")
     };
     names
         .iter()
-        .filter(|(name, lang)| lang.as_deref().is_some_and(|l| !l.is_empty() && !is_english(l)) && !name.trim().is_empty() && name != english)
-        .map(|(name, _)| name.clone())
-        .next()
+        .filter(move |(name, lang)| lang.as_deref().is_some_and(|l| !l.is_empty() && !is_english(l)) && !name.trim().is_empty() && name != english)
+        .map(|(name, _)| name.as_str())
 }
 
 pub fn is_hidden_family(name: &str) -> bool {

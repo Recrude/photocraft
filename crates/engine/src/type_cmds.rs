@@ -214,7 +214,9 @@ pub fn apply_char_props(s: &mut CharStyle, p: &Value) -> bool {
     let mut hit = |b: bool| any |= b;
     let font_key = ["font", "family", "fontStyle", "weight", "italic"].iter().any(|k| p.get(k).is_some());
     if let Some(v) = p.get("font").or_else(|| p.get("family")).and_then(Value::as_str) {
-        s.font_family = v.to_string();
+        // A family named in its own language ("맑은 고딕") is stored as the font menus name it.
+        let native = photocraft_text::shared().lock().unwrap_or_else(|e| e.into_inner()).fonts.family_of_native(v);
+        s.font_family = native.unwrap_or_else(|| v.to_string());
         s.postscript_name = None;
         hit(true);
     }
@@ -1128,6 +1130,55 @@ mod tests {
         let mut absent = CharStyle { font_family: "No Such Family 123".into(), ..Default::default() };
         apply_char_props(&mut absent, &json!({"font": "No Such Family 123"}));
         assert!(absent.postscript_name.is_none());
+    }
+
+    /// A copy of a bundled font whose family is `english` in English and `korean` in Korean.
+    fn korean_named_font(source: &[u8], english: &str, korean: &str) -> Vec<u8> {
+        let mut bytes = source.to_vec();
+        let count = u16::from_be_bytes([bytes[4], bytes[5]]) as usize;
+        let record = (0..count).map(|i| 12 + i * 16).find(|r| &bytes[*r..*r + 4] == b"name").unwrap();
+        let ps = english.replace(' ', "");
+        let names = [(0x409u16, 1u16, english), (0x409, 2, "Regular"), (0x409, 6, ps.as_str()), (0x409, 16, english), (0x412, 1, korean), (0x412, 16, korean)];
+        let mut table: Vec<u8> = [0u16, names.len() as u16, (6 + names.len() * 12) as u16].iter().flat_map(|v| v.to_be_bytes()).collect();
+        let mut strings = Vec::new();
+        for (lang, id, value) in names {
+            let encoded: Vec<u8> = value.encode_utf16().flat_map(u16::to_be_bytes).collect();
+            for n in [3, 1, lang, id, encoded.len() as u16, strings.len() as u16] {
+                table.extend(n.to_be_bytes());
+            }
+            strings.extend(encoded);
+        }
+        table.extend(strings);
+        let offset = bytes.len() as u32;
+        bytes[record + 8..record + 12].copy_from_slice(&offset.to_be_bytes());
+        bytes[record + 12..record + 16].copy_from_slice(&(table.len() as u32).to_be_bytes());
+        bytes.extend(table);
+        bytes
+    }
+
+    /// A font named in its own language ("맑은 고딕") is stored as its family, with that face's
+    /// PostScript name, and the text is laid out in it instead of a fallback.
+    #[test]
+    fn a_font_named_in_its_own_language_is_that_font() {
+        let font = korean_named_font(&photocraft_text::fonts::JETBRAINS_MONO_REGULAR, "Native Name Test", "네이티브 이름 테스트");
+        photocraft_text::shared().lock().unwrap().fonts.register_font_data(font);
+        let mut s = session();
+        let created = s.execute("type.create", json!({"text": "iiii", "font": "네이티브 이름 테스트", "size": 24})).unwrap()["layer"].as_u64().unwrap();
+        let restyled = s.execute("type.create", json!({"text": "iiii", "size": 24})).unwrap()["layer"].as_u64().unwrap();
+        s.execute("type.setStyle", json!({"layer": restyled, "font": "네이티브 이름 테스트"})).unwrap();
+        let english = s.execute("type.create", json!({"text": "iiii", "font": "Native Name Test", "size": 24})).unwrap()["layer"].as_u64().unwrap();
+        let width = |id| {
+            let t = text_layer(&s, id);
+            let mut engine = photocraft_text::shared().lock().unwrap();
+            engine.layout(&t, 72.0).lines[0].x1
+        };
+        for id in [created, restyled] {
+            let t = text_layer(&s, id);
+            let style = &t.char_runs()[0].style;
+            assert_eq!(style.font_family, "Native Name Test");
+            assert_eq!(style.postscript_name.as_deref(), Some("NativeNameTest"));
+            assert!((width(id) - width(english)).abs() < 0.01);
+        }
     }
 
     /// Picking a style or weight resets the weight axis to it; other axes keep their values (#2985).
